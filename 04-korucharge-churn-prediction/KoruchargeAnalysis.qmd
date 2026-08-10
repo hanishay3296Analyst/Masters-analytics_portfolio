@@ -1,0 +1,715 @@
+---
+title: "Korucharge Customer Churn Prediction Analysis"
+author: "Kieran, Lena, Queenie, Ziqian, Hanisha"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+## Introduction
+
+KoruCharge is a rapidly expanding electric vehicle charging network experiencing increasing customer churn. Understanding the factors that influence churn is essential for improving service reliability and maintaining long-term customer retention. This report applies machine learning techniques to predict customer churn and identify the behavioural and operational factors influencing customer decisions to leave the network.
+
+```{r}
+#| results: false
+# Data wrangling
+library(tidyverse)
+library(janitor)
+
+# Modelling
+library(tidymodels)
+library(themis)      # SMOTE / resampling
+library(bonsai)      # LightGBM / boosted trees
+library(discrim)     # Discriminant analysis models
+library(vip)         # Variable importance plots
+library(klaR)
+library(ranger)
+library(xgboost)
+library(lightgbm)
+
+# Parallel processing
+library(future)
+
+tidymodels_prefer()
+plan(multisession)
+
+# 1) Read the CSV
+# Note: Using your specific OneDrive path
+raw = read_csv("Assignment Files/korucharge_customers.csv", show_col_types = FALSE) |> 
+  clean_names()
+
+# 2) Comprehensive Clean and Recode
+clean = raw |> 
+  mutate(
+    # 1) ONLY parse columns that contain text/units
+    across(c(weeks_since_signup, weeks_since_last_charge, 
+             avg_wait_minutes, avg_kwh_per_session), parse_number),
+    
+    # 2) Percentages
+    peak_share = parse_number(peak_share) / 100,          
+    charger_fault_rate = parse_number(charger_fault_rate) / 100,
+    
+    # 3) Survey Logic
+    satisfaction_survey = as.numeric(na_if(satisfaction_survey, "NoResponse")),
+    survey_score_recoded = factor(case_when(
+      satisfaction_survey <= 3 ~ "Low/Mid",
+      satisfaction_survey >= 4 ~ "High",
+      TRUE ~ "Missing"
+    ), levels = c("Low/Mid", "High", "Missing")),
+    
+    # 4) The Categorical "Across"
+    across(c(region, plan_tier, payment_type, device_os, support_ticket,
+             notification_opt_in, email_opened_last, home_charging_access, 
+             refund_request_last12w, payment_failure_last4w, 
+             price_change_exposed), as.factor),
+    
+    # 5) Specific Factor Recoding
+    gender = fct_recode(as.factor(gender),
+                        Unknown = "Prefer Not to Answer / Other / Unknown"),
+    
+    # 6) Integers
+    across(c(age, charging_sessions_12w, app_crashes_30d, app_version_lag_weeks), as.integer),
+    
+    # 7) Target Variable
+    retained = factor(retained_binary, levels = c(0,1), labels = c("Churned","Retained"))
+  ) |> 
+  select(-retained_binary)
+
+# --- 3) ISOLATE FOR INLINE MODELING ---
+# Instead of exporting an RDS, we create a dedicated modeling environment in memory.
+# This prevents our global environment from getting cluttered and strictly separates 
+# data preparation from model training.
+
+model_env <- new.env()             # Initialize a new isolated environment
+model_env$data <- clean            # Assign the cleaned dataset to this environment
+
+# Optional but recommended: Remove the raw data from the global environment to free up memory
+rm(raw) 
+
+# --- 4) QC Checks (Referencing the new environment) ---
+print("Frequency of Payment Failures:")
+table(model_env$data$payment_failure_last4w)
+
+# Verify factor structure
+str(model_env$data)
+
+# --- 5) INITIATE MODELING PIPELINE ---
+# You can now seamlessly transition into your tidymodels workflow
+# Example: Setting a seed and splitting the data for cross-validation
+set.seed(123)
+model_env$data_split <- initial_split(model_env$data, prop = 0.8, strata = retained)
+model_env$train_data <- training(model_env$data_split)
+model_env$test_data  <- testing(model_env$data_split)
+```
+
+```{r}
+#| echo: false
+# Enable parallel processing
+plan(multisession)
+tidymodels_prefer()
+
+# --- OPTION A: Sampled Dataset (Uncomment to use for rapid prototyping) ---
+ #set.seed(704)
+ #model_data <- model_env$data |>
+   #select(-weeks_since_signup, -satisfaction_survey) |>
+  # slice_sample(prop = 0.10)
+
+# --- OPTION B: Full Dataset (Active for final modeling) ---
+ set.seed(704)
+ # Pulling directly from our isolated environment
+ model_data <- model_env$data |>
+ select(-weeks_since_signup, -satisfaction_survey)
+
+# --- Split and Folds ---
+# We use stratified splitting to ensure the proportion of churned vs. retained 
+# customers remains consistent across all our datasets.
+koru_split <- initial_split(model_data, prop = 0.75, strata = retained)
+train_data <- training(koru_split)
+test_data  <- testing(koru_split)
+
+# 5-fold cross-validation for robust performance estimation
+cv_folds   <- vfold_cv(train_data, v = 5, strata = retained)
+
+# Clean up intermediate objects to save some memory
+rm(model_data)
+```
+
+## Data-set Overview
+
+The analysis used the KoruCharge customer dataset, which contains behavioural, operational, and service-related variables relevant to churn prediction, including charging activity, billing events, application reliability, subscription plans, and regional usage patterns.
+
+The target variable, retained, classifies customers as either Churned or Retained. Data preparation included converting numeric variables stored as text, transforming percentage variables into proportions, and recoding categorical variables into consistent factor levels. Customer satisfaction survey responses were also grouped into three categories: Low/Mid, High, and Missing.
+
+Missing values were handled through median imputation for numeric predictors and mode imputation for categorical variables. The final dataset as displayed in Table 1 contained predictors representing customer engagement, service reliability, billing interactions, and regional network conditions. These variables capture multiple aspects of customer behaviour and service experience, providing a comprehensive basis for modelling customer churn risk.
+
+```{r}
+#| include: false
+#| label: tbl-dataset-overview
+#| tbl-cap: "Class distribution of the churn outcome variable."
+
+clean %>%
+  count(retained) %>%
+  mutate(
+    Percentage = round(n / sum(n) * 100, 1)
+  ) %>%
+  rename(
+    Customer_Status = retained,
+    Count = n
+  ) %>%
+  knitr::kable(align = c("l", "c", "c"))
+```
+
+```{r}
+#| label: tbl-variable-groups
+#| tbl-cap: "Key variable groups used in the churn analysis."
+
+tibble::tibble(
+  Variable_Group = c(
+    "Customer engagement",
+    "Billing interactions",
+    "Charging experience",
+    "App reliability",
+    "Customer profile",
+    "Regional conditions"
+  ),
+  
+  Example_Variables = c(
+    "weeks_since_last_charge, charging_sessions_12w",
+    "payment_failure_last4w, refund_request_last12w, price_change_exposed",
+    "avg_wait_minutes, peak_share",
+    "app_crashes_30d, app_version_lag_weeks",
+    "plan_tier, home_charging_access, survey_score_recoded",
+    "region"
+  )
+) %>%
+knitr::kable(align = c("l","l"))
+```
+
+```{r}
+# --- STRATEGY A: ALL REMAINING ---
+rec_all <- recipe(retained ~ ., data = train_data) %>%
+  update_role(user_id, new_role = "ID") %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  #SELECT EITHER DOWNSAMPLE OR SMOTE
+  step_upsample(retained, over_ratio = 1)
+  #step_downsample(retained, under_ratio = 1)
+
+# --- STRATEGY B: REFINED (No chaining, clean start) ---
+rec_refined <- recipe(retained ~ ., data = train_data) %>%
+  update_role(user_id, new_role = "ID") %>%
+  # Remove biased/noisy vars BEFORE dummying
+  step_rm(age, gender, device_os, 
+          app_crashes_30d, charging_sessions_12w) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  #SELECT EITHER DOWNSAMPLE OR SMOTE
+  step_upsample(retained, over_ratio = 1)
+  #step_downsample(retained, under_ratio = 1)
+
+# --- STRATEGY C: INTERACTIONS (UPDATED) ---
+rec_interact <- recipe(retained ~ ., data = train_data) %>%
+  update_role(user_id, new_role = "ID") %>%
+  # 1. Drop the excluded variables immediately
+  step_rm(age, gender, device_os, 
+          app_crashes_30d, charging_sessions_12w) %>%
+  
+  # 2. Impute missing values
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # 3. DUMMY FIRST (Convert categories to 1s and 0s)
+  step_dummy(all_nominal_predictors()) %>% 
+  
+  # 4. INTERACT SECOND (Multiply the 1s and 0s)
+  # Using starts_with() safely catches the new dummy column names
+  step_interact(terms = ~ starts_with("plan_tier_"):avg_wait_minutes + 
+                          starts_with("price_change_exposed_"):starts_with("payment_failure_last4w_")) %>%
+  
+  # 5. FINAL TOUCHES
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  #SELECT EITHER DOWNSAMPLE OR SMOTE
+  #step_downsample(retained, under_ratio = 1)
+  step_upsample(retained, over_ratio = 1)
+```
+
+## **Modelling**
+
+### Model Development Strategy
+
+To identify the most effective predictive approach, a model comparison framework was implemented using the tidymodels workflow system. Five classification algorithms were evaluated: Logistic Regression, Naïve Bayes, Random Forest, XGBoost, and LightGBM. These models were selected to compare both interpretable statistical methods and more complex machine learning algorithms. Logistic regression provides interpretable coefficients that allow key predictors to be understood, while ensemble models such as Random Forest and gradient boosting methods are capable of capturing more complex non-linear relationships between variables. The k-Nearest Neighbours (k-NN) algorithm was not included because distance-based models are sensitive to high-dimensional feature spaces created by dummy encoding and provide limited interpretability for identifying churn drivers.
+
+Three feature engineering strategies were tested using separate preprocessing recipes. The first strategy included all available predictors after preprocessing. Missing values were imputed using median and mode imputation for numeric and categorical variables respectively. Categorical predictors were converted into dummy variables, and numeric predictors were standardised to ensure comparable scaling across variables.
+
+The second strategy used a refined set of predictors, where selected variables such as age, gender, and device operating system were removed before modelling. These variables were excluded to reduce potential noise and minimise the risk of introducing predictors with limited predictive value or potential bias.
+
+The third strategy introduced interaction features to capture relationships between operational variables. For example, interactions between subscription plan tier and charging wait times, and between price change exposure and payment failures, were included to explore whether combinations of service conditions jointly influence churn behaviour.
+
+Because churn events represent a minority class in the dataset, class imbalance was addressed using upsampling. This resampling approach randomly duplicates existing examples of the minority class during model training, ensuring the algorithm has sufficient exposure to learn the patterns associated with churn effectively.
+
+```{r}
+lr_spec   <- logistic_reg() %>% set_engine("glm")
+nb_spec   <- naive_Bayes() %>% 
+  set_engine("klaR") %>% 
+  set_mode("classification")
+rf_spec   <- rand_forest(trees = 500) %>% set_engine("ranger") %>% set_mode("classification")
+xgb_spec  <- boost_tree() %>% set_engine("xgboost") %>% set_mode("classification")
+lgbm_spec <- boost_tree() %>% set_engine("lightgbm") %>% set_mode("classification")
+```
+
+```{r}
+# Create the Workflow Set
+model_tournament <- workflow_set(
+  preproc = list(All_Vars = rec_all, Refined = rec_refined, Interact = rec_interact),
+  models  = list(LR = lr_spec, NB = nb_spec, RF = rf_spec, XGB = xgb_spec, LGBM = lgbm_spec),
+  cross   = TRUE
+)
+
+# Run Cross-Validation
+tournament_results <- model_tournament %>%
+  workflow_map("fit_resamples", 
+               resamples = cv_folds, 
+               metrics = metric_set(roc_auc, sens, spec),
+               verbose = TRUE,
+control = control_resamples(save_pred = TRUE)
+)
+```
+
+### Model Evaluation
+
+Model performance was evaluated using five-fold cross-validation, which helps reduce the risk of overfitting and ensures that results are robust across different subsets of the training data. Three evaluation metrics were used: ROC AUC, sensitivity, and specificity.
+
+```{r}
+#| include: false
+#| label: all-res
+#| results: markup
+
+### Examine results
+
+# Extract averaged metrics across all folds for all models in the tournament
+all_res <- tournament_results %>% collect_metrics(summarize = TRUE)
+
+# Extract predictions across all folds (requires save_pred = TRUE in step 4)
+all_pred <- tournament_results %>% collect_predictions(summarize = TRUE)
+
+# View top performing models by ROC AUC
+all_res %>% 
+  filter(.metric == "roc_auc") %>% 
+  arrange(desc(mean)) %>% 
+  select(wflow_id, mean, std_err) %>% 
+  print(n = 12)
+
+#| label: tbl-model-ranking
+#| tbl-cap: "Top workflow configurations ranked by mean cross-validated ROC AUC."
+
+all_res %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean)) %>%
+  mutate(
+    `Mean ROC AUC` = round(mean, 3),
+    `Std. Error` = round(std_err, 4)
+  ) %>%
+  select(`Workflow` = wflow_id, `Mean ROC AUC`, `Std. Error`) %>%
+  head(12) %>%
+  knitr::kable(align = c("l", "c", "c"))
+```
+
+Figure 1 presents the mean ROC AUC values with standard errors for each workflow configuration. All models demonstrated strong predictive performance, with ROC AUC values exceeding 0.94, indicating a high ability to distinguish between churned and retained customers. Logistic Regression and LightGBM achieved the highest average ROC AUC values while also demonstrating stable performance across cross-validation folds.
+
+```{r}
+#| warning: false
+#| label: fig-plot-stability
+#| fig-width: 10
+#| fig-height: 6
+
+# Unpack the ID for clearer plotting
+stability_data <- all_res %>%
+  filter(.metric == "roc_auc") %>%
+  separate(wflow_id, into = c("Strategy", "Model"), sep = "_", remove = FALSE)
+
+# Visualize Stability
+ggplot(stability_data, aes(x = reorder(wflow_id, mean), y = mean, color = Strategy)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), width = 0.3) +
+  coord_flip() +
+  theme_minimal() +
+  scale_color_viridis_d(option = "mako", begin = 0.3, end = 0.7) +
+  labs(
+    title = "Model Stability Report: Performance vs. Risk",
+    subtitle = "Higher Mean = Better Performance | Smaller Error Bars = More Reliable",
+    x = "Model Configuration",
+    y = "Mean ROC AUC (with Standard Error)",
+    color = "Feature Strategy"
+  )
+```
+
+```{r}
+#| include: false
+#| label: plot-roc-folds
+#| fig-width: 12
+#| fig-height: 10
+
+# Visualise ROC curves
+# 1. Extract the UN-summarized predictions
+all_pred_folds <- tournament_results %>% 
+  collect_predictions(summarize = FALSE)
+
+# 2. Generate the faceted ROC curves
+all_pred_folds %>% 
+  group_by(id, wflow_id) %>% 
+  # Focus on predicting "Churned" (the first level)
+  roc_curve(truth = retained, .pred_Churned, event_level = "first") %>% 
+  autoplot(aes(col = wflow_id)) + 
+  facet_wrap(facets = vars(wflow_id), ncol = 4) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold", size = 9)) + 
+  labs(
+    title = "ROC by Fold: Stability Check Across All Configurations",
+    subtitle = "Tightly grouped curves indicate consistent performance across different data splits.",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  )
+```
+
+Figure 2 compares model performance across the three evaluation metrics. While ensemble models such as Random Forest and XGBoost achieved competitive results, logistic regression produced comparable predictive performance while offering greater interpretability.
+
+Sensitivity was considered particularly important because the primary objective of churn modelling is to correctly identify customers who are likely to leave the service. Logistic regression achieved one of the highest sensitivity scores among the evaluated models, meaning the model effectively detects customers at risk of churn.
+
+Among the feature engineering strategies, the all-variable preprocessing recipe produced the most stable and consistent performance across cross-validation folds. This configuration was therefore selected for the final model because it balances predictive performance with model interpretability.
+
+Table 2 shows the results of the interaction terms that were tested. Only one interaction had statistical significance, suggesting that individual operational variables capture the majority of churn risk. The significant interaction was tested in the final model, however it did not result in an increase in the final ROC AUC score, so was left out to reduce model complexity.
+
+```{r}
+#| label: tbl-interaction-evidence
+#| warning: false
+#| tbl-cap: "Significance of Engineered Business Interactions"
+
+library(gtools)
+library(dplyr)
+library(stringr)
+
+# 1. Extract and fit the champion model
+interact_fit <- tournament_results %>%
+  extract_workflow("Interact_LR") %>%
+  fit(data = train_data)
+
+# 2. Tidy, calculate, and format for the reader
+interaction_importance <- interact_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  # Filter for interactions first to save processing time
+  filter(str_detect(term, "_x_") | str_detect(term, ":")) %>% 
+  mutate(
+    Odds_Ratio = exp(estimate),
+    Significance = gtools::stars.pval(p.value),
+    # Optional: Clean up the raw variable names for the reader
+    term = str_replace_all(term, "_x_|_|:", " × ") 
+  ) %>%
+  arrange(p.value) %>%
+  # Select only what the reader needs and give them proper titles
+  select(
+    `Interaction Term` = term,
+    `Log Odds` = estimate,
+    `Odds Ratio` = Odds_Ratio,
+    `Std. Error` = std.error,
+    `P-Value` = p.value,
+    `Sig.` = Significance
+  )
+
+# 3. Print the clean table
+knitr::kable(
+  interaction_importance, 
+  digits = 3, 
+  align = c("l", "c", "c", "c", "c", "c")
+)
+```
+
+```{r}
+#| label: fig-plot-res
+#| fig-width: 10
+#| fig-height: 10
+#| out-width: "100%"
+
+# Compare performance across key metrics
+# Ensure all_res is available in your environment first
+# all_res <- tournament_results %>% collect_metrics(summarize = TRUE)
+
+all_res %>% 
+  # Filter to the metrics explicitly tracked in your workflow_map
+  filter(.metric %in% c("roc_auc", "sens", "spec")) %>% 
+  ggplot() + 
+  geom_col(aes(y = reorder(wflow_id, desc(wflow_id)), 
+               x = mean, 
+               fill = wflow_id)) +
+  # Create a separate panel for each metric stacked vertically
+  facet_wrap(facets = vars(.metric), ncol = 1) +
+  labs(y = "Workflow Configuration", 
+       x = "Mean Score",
+       title = "Performance Comparison Across All Tournament Workflows") + 
+  xlim(0, 1) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)) +
+  theme(legend.position = "none")
+```
+
+```{r}
+#| label: specify-final-model
+
+# The final, bulletproof recipe based on our findings
+rec_final <- recipe(retained ~ ., data = train_data) %>%
+  update_role(user_id, new_role = "ID") %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_downsample(retained, under_ratio = 1)
+
+# Finalise the workflow
+final_wflow <- workflow() %>%
+  add_model(logistic_reg() %>% set_engine("glm")) %>%
+  add_recipe(rec_final)
+```
+
+### Final Model Selection and Key Drivers
+
+The logistic regression model was trained on the full training dataset and evaluated on a holdout test set to assess performance on unseen data.
+
+```{r}
+
+#| label: final-fit
+
+# Fit to training set and evaluate on test set simultaneously
+final_fit <- final_wflow %>%
+  last_fit(koru_split, metrics = metric_set(roc_auc, accuracy, sens, spec))
+```
+
+As shown in Figure 3, the model achieved a ROC AUC of 0.954, indicating excellent discrimination between churned and retained customers. Sensitivity reached 0.893, meaning that nearly 89% of churned customers were correctly identified. Accuracy and specificity were 0.877 and 0.870, demonstrating strong overall classification performance.
+
+The confusion matrix further confirms the model’s predictive ability. The model correctly classified 13,634 churned customers and 30,219 retained customers, while 1,637 churn cases were incorrectly predicted as retained. In Figure 4 the ROC curve also shows strong separation between the two classes, indicating reliable performance on unseen data.
+
+```{r}
+#| label: tbl-final-metrics
+#| tbl-cap: "Final model performance on the 25% holdout test set."
+#| warning: false
+#| include: false
+
+# Extract test metrics and predictions
+final_res <- final_fit %>% collect_metrics()
+final_pred <- final_fit %>% collect_predictions() 
+
+# Format selected metrics as a table
+final_res %>%
+  filter(.metric %in% c("roc_auc", "sens", "accuracy", "spec")) %>%
+  mutate(
+    Metric = recode(.metric,
+      roc_auc = "ROC AUC",
+      sens = "Sensitivity",
+      accuracy = "Accuracy",
+      spec = "Specificity"
+    ),
+    Estimate = round(.estimate, 3)
+  ) %>%
+  select(Metric, Estimate) %>%
+  knitr::kable(align = c("l", "c"))
+
+```
+
+```{r}
+#| label: tbl-confusion
+#| tbl-cap: "Confusion matrix for the final logistic regression model on the holdout test set."
+#| warning: false
+
+final_pred %>%
+  count(.pred_class, retained) %>%
+  mutate(
+    .pred_class = recode(.pred_class,
+      "Churned" = "Predicted Churned",
+      "Retained" = "Predicted Retained"
+    )
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = retained,
+    values_from = n
+  ) %>%
+  rename(
+    Prediction = .pred_class,
+    `Actual Churned` = Churned,
+    `Actual Retained` = Retained
+  ) %>%
+  knitr::kable(align = c("l", "c", "c"))
+```
+
+```{r}
+#| label: fig-final-metrics-barchart
+#| fig-width: 8
+#| fig-height: 5
+
+### 2. Final Model Metrics Bar Chart
+# Use the final_res object extracted from your last_fit()
+final_res %>%
+  # Filter to our key metrics
+  filter(.metric %in% c("roc_auc", "sens", "spec", "accuracy")) %>%
+  # Reorder metrics by their score for a cleaner look
+  ggplot(aes(x = .estimate, y = reorder(.metric, .estimate), fill = .metric)) +
+  geom_col() +
+  # Add the exact numbers to the end of the bars
+  geom_text(aes(label = round(.estimate, 3)), hjust = -0.2, fontface = "bold") + 
+  scale_fill_viridis_d(option = "mako", begin = 0.3, end = 0.8) +
+  xlim(0, 1.1) + # Extend slightly past 1 so the text labels fit
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.y = element_text(size = 12, face = "bold")) +
+  labs(
+    title = "Final Model Performance on Test Data",
+    subtitle = "Metrics evaluated on the 25% holdout split",
+    x = "Score",
+    y = "Evaluation Metric"
+  )
+```
+
+```{r}
+#| label: fig-final-roc-curve
+#| fig-width: 8
+#| fig-height: 6
+
+# Use the final_pred object extracted from your last_fit()
+final_pred %>%
+  # Focus on predicting "Churned" (the first level)
+  roc_curve(truth = retained, .pred_Churned, event_level = "first") %>%
+  autoplot() +
+  theme_minimal() +
+  labs(
+    title = "Final Champion Model: Test Set ROC Curve",
+    subtitle = "Evaluating the final logistic regression model on unseen holdout data",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  )
+```
+
+To interpret the influence of predictors, logistic regression coefficients were converted into odds ratios. Figure 5 presents the odds ratios from the logist regression model on a logarithmic scale. The strongest driver of churn was weeks since last charge (OR = 21.81), indicating that inactive users are significantly more likely to churn. Other operational factors also increased churn risk, including payment failures in the previous four weeks (OR = 2.84) and longer charging wait times (OR = 2.57). Additional drivers included refund requests, price change exposure, and regional differences, particularly in the West Coast and Otago. In contrast, higher satisfaction scores, frequent charging sessions, and higher subscription plans were associated with lower churn risk.
+
+```{r}
+#| label: extract-final-coefficients
+
+# Extract coefficients from the model fitted to the full split
+final_model_obj <- final_fit %>% extract_fit_parsnip()
+
+final_summary <- final_model_obj %>%
+  tidy() %>%
+  mutate(
+    # Flip the estimate to specifically look at Churn Risk
+    estimate_churn = estimate * -1,
+    odds_ratio = exp(estimate_churn),
+    significance = gtools::stars.pval(p.value)
+  ) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(odds_ratio))
+
+# Keep top 15 drivers for visualisation
+plot_data <- final_summary %>%
+  slice_max(abs(estimate_churn), n = 15)
+```
+
+```{r}
+#| label: fig-visualize-odds-ratios 
+#| fig-width: 10 
+#| fig-height: 8
+# Clean variable names for presentation
+plot_data_clean <- plot_data %>%
+  mutate(
+    term_clean = recode(term,
+      
+      # Engagement
+      "weeks_since_last_charge" = "Weeks since last charge",
+      "charging_sessions_12w" = "Charging sessions (last 12 weeks)",
+      
+      # Billing
+      "payment_failure_last4w_TRUE." = "Recent payment failure",
+      "price_change_exposed_TRUE." = "Exposed to price change",
+      "refund_request_last12w_TRUE." = "Recent refund request",
+      
+      # Charging experience
+      "avg_wait_minutes" = "Average charging wait time",
+      "peak_share" = "Peak usage share",
+      
+      # App reliability
+      "app_crashes_30d" = "App crashes (last 30 days)",
+      
+      # Regions
+      "region_WestCoast" = "West Coast region",
+      "region_Otago" = "Otago region",
+      
+      # Plan tiers
+      "plan_tier_Fleet" = "Fleet plan",
+      "plan_tier_Pro" = "Pro plan",
+      "plan_tier_Plus" = "Plus plan",
+      
+      # Behaviour / engagement
+      "email_opened_last_TRUE." = "Opened marketing email",
+      
+      # Satisfaction
+      "survey_score_recoded_High" = "High satisfaction score",
+      "survey_score_recoded_Missing" = "Missing satisfaction score",
+      
+      # fallback
+      .default = term
+    )
+  )
+
+#| label: fig-odds-ratio
+#| fig-cap: "Odds ratios from the final logistic regression model. Values above 1 indicate higher churn risk, while values below 1 indicate factors associated with customer retention."
+#| fig-width: 8
+#| fig-height: 5
+
+ggplot(plot_data_clean, aes(x = odds_ratio, y = reorder(term_clean, odds_ratio))) +
+  
+  geom_vline(xintercept = 1, color = "black", linewidth = 1) +
+  
+  geom_segment(
+    aes(x = 1, xend = odds_ratio, yend = term_clean),
+    color = ifelse(plot_data_clean$odds_ratio > 1, "#e84855", "#3bb273"),
+    linewidth = 1
+  ) +
+  
+  geom_point(aes(color = odds_ratio > 1), size = 5, show.legend = FALSE) +
+  
+  geom_text(
+    aes(label = round(odds_ratio, 2)),
+    vjust = -1,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  
+  scale_x_log10(breaks = c(0.2, 0.5, 1, 2, 5, 10, 25)) +
+  
+  scale_color_manual(values = c("TRUE" = "#e84855", "FALSE" = "#3bb273")) +
+  
+  theme_minimal() +
+  
+  labs(
+    title = "Key Drivers of Customer Churn",
+    subtitle = "Logistic regression odds ratios (log scale)",
+    x = "Odds Ratio",
+    y = NULL
+  )
+```
+
+## Recommendations and Conclusion
+
+Machine learning models were used to predict customer churn within the KoruCharge network. Logistic regression delivered strong predictive performance while remaining interpretable, enabling the identification of key churn drivers. The results indicate that customer inactivity, payment friction, charging wait times, and service reliability are the main factors influencing churn.
+
+To reduce churn, KoruCharge should focus on four strategic actions: re-engaging inactive users through targeted promotions and reminders, improving payment system reliability to reduce billing issues, reducing charging wait times at high-demand stations, and strengthening platform and network reliability. Addressing these operational and engagement factors can improve customer experience and support long-term network growth.
