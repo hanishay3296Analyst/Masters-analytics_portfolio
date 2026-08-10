@@ -1,6 +1,4 @@
-# Masters-analytics_portfolio
-Data analytics projects from Master of Business Analytics (FinTech) — University of Auckland. Python, R, SQL, Power BI, Azure, Excel.
-# MBA Analytics Portfolio
+# MBAn Analytics Portfolio
 **Hanisha Yanamadala**  
 Master of Business Analytics (FinTech) — University of Auckland (Expected Dec 2026)  
 📧 hanishay3296@gmail.com | 📍 Auckland, New Zealand
